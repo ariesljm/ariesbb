@@ -29,6 +29,7 @@ jobs:
           echo "TARGET_FILE=worker.zip" >> $GITHUB_ENV
 
       - name: 检查并更新 Worker
+        id: check_update # <-- 增加 ID 以便后续步骤引用
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # 使用 GitHub Token 认证
         run: |
@@ -52,11 +53,19 @@ jobs:
           TAG_NAME=$(echo "$RESPONSE" | jq -r '.[0].tag_name')
           DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.[0].assets[] | select(.name == "'"$TARGET_FILE"'") | .browser_download_url')
 
+          if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" == "null" ]; then
+            log "WARN: 未找到最新的 release tag"
+            TAG_NAME="未知" # 设置默认值以防万一
+          fi
+          
           if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
             log "ERROR: 未找到 $TARGET_FILE"
             exit 1
           fi
           log "最新版本: $TAG_NAME"
+          
+          # 将 TAG_NAME 设置为步骤的输出变量
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
 
           # 判断是否需要更新
           FORCE_UPDATE=${{ github.event.inputs.force_update || 'false' }}
@@ -74,9 +83,13 @@ jobs:
           echo "$TAG_NAME" > version.txt
           log "更新完成，新版本: $TAG_NAME"
 
+      - name: 拉取最新更改以避免冲突 # <-- 核心修复：在这里拉取最新代码
+        run: git pull --rebase
+
       - name: 提交更改
         if: success() # 仅在更新成功时提交
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🔄 自动同步 Worker 版本: ${{ steps.check_update.outputs.tag_name || '未知' }}"
+          # <-- 修复：正确引用版本号，并为未知情况提供默认值
+          commit_message: "🔄 自动同步 Worker 版本: ${{ steps.check_update.outputs.tag_name }}"
           commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
