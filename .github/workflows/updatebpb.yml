@@ -5,7 +5,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: "0 1 * * *" # 每天凌晨1点运行
+    - cron: "0 1 * * *" # 每天凌晨1点运行 (UTC时间，对应北京时间上午9点)
   workflow_dispatch:
     inputs:
       force_update:
@@ -22,6 +22,13 @@ jobs:
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
+        with:
+          # 在 schedule 触发时，确保我们获取的是最新的代码而不是一个旧的 commit
+          # 对于 push 和 workflow_dispatch 这不是必需的，但加上无害
+          ref: main 
+
+      - name: 拉取最新更改以避免冲突 # <--- 核心修复：将此步骤移至修改文件之前
+        run: git pull --rebase
 
       - name: 设置环境
         run: |
@@ -29,9 +36,9 @@ jobs:
           echo "TARGET_FILE=worker.zip" >> $GITHUB_ENV
 
       - name: 检查并更新 Worker
-        id: check_update # <-- 增加 ID 以便后续步骤引用
+        id: check_update
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # 使用 GitHub Token 认证
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # 日志函数
           log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
@@ -44,10 +51,17 @@ jobs:
 
           # 获取最新 Release
           log "获取最新 Release 信息..."
-          RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$REPO_URL")
+          # 使用 --silent 和 --fail 来更好地处理HTTP错误
+          RESPONSE=$(curl -s -f --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$REPO_URL")
           if [ $? -ne 0 ]; then
-            log "ERROR: 无法访问 GitHub API"
+            log "ERROR: 无法访问 GitHub API 或仓库没有 Release"
             exit 1
+          fi
+
+          # 检查返回的JSON是否为空数组
+          if [ "$(echo "$RESPONSE" | jq 'length')" -eq 0 ]; then
+              log "WARN: 远程仓库没有任何 Release，跳过更新"
+              exit 0
           fi
 
           TAG_NAME=$(echo "$RESPONSE" | jq -r '.[0].tag_name')
@@ -55,22 +69,24 @@ jobs:
 
           if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" == "null" ]; then
             log "WARN: 未找到最新的 release tag"
-            TAG_NAME="未知" # 设置默认值以防万一
+            TAG_NAME="未知"
           fi
           
+          # 将 TAG_NAME 设置为步骤的输出变量，即使后续不更新也设置，以便调试
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          
           if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
-            log "ERROR: 未找到 $TARGET_FILE"
+            log "ERROR: 在最新 Release 中未找到 $TARGET_FILE"
             exit 1
           fi
           log "最新版本: $TAG_NAME"
           
-          # 将 TAG_NAME 设置为步骤的输出变量
-          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
-
           # 判断是否需要更新
           FORCE_UPDATE=${{ github.event.inputs.force_update || 'false' }}
           if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != "true" ]; then
             log "已是最新版本，无需更新"
+            # 设置一个标志，让后续步骤知道没有更新发生
+            echo "updated=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -78,18 +94,17 @@ jobs:
           log "下载 $TARGET_FILE..."
           wget -q -O "$TARGET_FILE" "$DOWNLOAD_URL"
           log "解压 $TARGET_FILE..."
-          unzip -o "$TARGET_FILE"
+          unzip -o "$TARGET_FILE" -d . # 明确指定解压到当前目录
           rm "$TARGET_FILE"
           echo "$TAG_NAME" > version.txt
           log "更新完成，新版本: $TAG_NAME"
-
-      - name: 拉取最新更改以避免冲突 # <-- 核心修复：在这里拉取最新代码
-        run: git pull --rebase
+          # 设置更新标志
+          echo "updated=true" >> $GITHUB_OUTPUT
 
       - name: 提交更改
-        if: success() # 仅在更新成功时提交
+        # 仅在 check_update 步骤成功且其输出 updated 为 'true' 时运行
+        if: steps.check_update.outputs.updated == 'true'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          # <-- 修复：正确引用版本号，并为未知情况提供默认值
           commit_message: "🔄 自动同步 Worker 版本: ${{ steps.check_update.outputs.tag_name }}"
-          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+          commit_author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
